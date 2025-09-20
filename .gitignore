@@ -1,2 +1,22 @@
-venv/
-.env
+venv/venv/
+
+.env.env
+.env.local
+.env.production
+.env.development
+*.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDEs
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
