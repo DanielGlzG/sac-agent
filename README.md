@@ -41,7 +41,7 @@ source .venv/bin/activate
 4. **Instala las dependencias:**
 
 ```bash
-pip install -r src/requirements.txt
+pip install -r requirements.txt
 ```
 
 ## ⚙️ Configuración
@@ -109,3 +109,12 @@ curl -X POST http://localhost:8080/invocations \
 "user_id": "247",
 "metadata": {}
 }'
+
+aws logs delete-log-group \
+ --log-group-name "/aws/bedrock-agentcore/runtimes/agentcore_app-0zf2Td5dn0-DEFAULT"
+
+aws logs delete-log-group \
+ --log-group-name "/aws/bedrock-agentcore/runtimes/agentcore_app-VZu3VRA4TG-DEFAULT"
+
+aws logs delete-log-group \
+ --log-group-name "/aws/bedrock-agentcore/runtimes/agentcore_app-VZu3VRA4TG-endpoint_bz9co"

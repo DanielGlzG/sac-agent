@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional
 from bedrock_agentcore import BedrockAgentCoreApp
 from bedrock_agentcore.runtime.context import RequestContext
 
+
 # Import your existing text-to-sql function
 import sys
 import os
@@ -165,27 +166,9 @@ async def customer_service_agent(payload: Dict[str, Any], context: RequestContex
 
 
 @app.ping
-def health_check():
-    """Custom health check for the customer service agent"""
-    try:
-        # Basic health check for customer service agent
-        return {
-            "status": "healthy",
-            "service": "customer-service-empresa",
-            "timestamp": datetime.now().isoformat(),
-            "runtime": "agentcore",
-            "features": {
-                "bedrock_knowledge_base": True,
-                "session_memory": True,
-                "escalation_support": True
-            }
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy", 
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
+def ping():
+    return "Healthy"
+
 
 
 if __name__ == "__main__":
