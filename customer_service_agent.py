@@ -25,12 +25,19 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
+# Import prompts
+from prompts import SYSTEM_PROMPT_SERVICE_AGENT, SYSTEM_PROMPT_KNOWLEDGE_ASSISTANT, SYSTEM_PROMPT_SERVICE_AGENT_V2
+
 # Import AgentCore context for memory management
 try:
     from bedrock_agentcore.runtime.context import RequestContext
+    from bedrock_agentcore.memory import MemoryClient
+    from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 except ImportError:
     # Fallback for testing without AgentCore
     RequestContext = None
+    MemoryClient = None
+    AgentCoreMemoryToolProvider = None
 
 load_dotenv()
 
@@ -94,6 +101,27 @@ AWS_CONFIG = {
 # ID de la Knowledge Base (debe ser configurado para tu KB específica)
 KNOWLEDGE_BASE_ID = os.getenv("KNOWLEDGE_BASE_ID")  # Reemplaza con tu Knowledge Base ID real
 
+# Configuración de AgentCore Memory
+# Verificar que las variables de entorno estén configuradas
+_memory_id = os.getenv("AGENTCORE_MEMORY_ID")
+_region = os.getenv("AWS_REGION")
+_user_pref_strategy = os.getenv("MEMORY_STRATEGY_USER_PREFERENCES")
+_summaries_strategy = os.getenv("MEMORY_STRATEGY_SUMMARIES")
+_semantic_strategy = os.getenv("MEMORY_STRATEGY_SEMANTIC")
+
+
+
+MEMORY_CONFIG = {
+    "memory_id": _memory_id,
+    "region": _region,
+    "actor_id_prefix": "customer_",  # Prefijo para identificar usuarios
+    "namespaces": {
+        "user_preferences": f"/strategies/{_user_pref_strategy}/actors/{{actor_id}}",
+        "conversation_summaries": f"/strategies/{_summaries_strategy}/actors/{{actor_id}}/sessions/{{session_id}}",
+        "semantic_memory": f"/strategies/{_semantic_strategy}/actors/{{actor_id}}"
+    }
+}
+
 class BedrockKnowledgeBaseClient:
     """Cliente para interactuar con AWS Bedrock Knowledge Base (solo para recuperación)."""
     
@@ -116,12 +144,6 @@ class BedrockKnowledgeBaseClient:
                 config=bedrock_config
             )
             
-            # Cliente para operaciones de administración
-            self.bedrock_agent = boto3.client(
-                "bedrock-agent",
-                region_name=self.region,
-                config=bedrock_config
-            )
             
             logger.info(f"✅ Cliente Bedrock inicializado para región: {self.region}")
             
@@ -200,36 +222,186 @@ class BedrockKnowledgeBaseClient:
 # Instancia global del cliente Bedrock
 bedrock_client = BedrockKnowledgeBaseClient()
 
-def search_local_knowledge_base(query: str) -> str:
-    """
-    Fallback: Búsqueda básica en base de conocimientos local cuando Bedrock no está disponible.
+class AgentCoreMemoryManager:
+    """Gestor de memoria para AgentCore con estrategias de corto y largo plazo."""
     
-    Args:
-        query: Consulta de búsqueda
+    def __init__(self, memory_id: str = None, region: str = None):
+        self.memory_id = memory_id or MEMORY_CONFIG["memory_id"]
+        self.region = region or MEMORY_CONFIG["region"]
+        self.actor_id_prefix = MEMORY_CONFIG["actor_id_prefix"]
+        self.namespaces = MEMORY_CONFIG["namespaces"]
         
-    Returns:
-        str: Respuesta de fallback
-    """
-    tools_logger.info(f"🔧 LOCAL KB FALLBACK: Query: '{query}'")
+        # Inicializar cliente de memoria si está disponible
+        if MemoryClient:
+            try:
+                self.memory_client = MemoryClient(region_name=self.region)
+                memory_logger.info(f"🧠 AgentCore Memory initialized | Memory ID: {self.memory_id} | Region: {self.region}")
+            except Exception as e:
+                memory_logger.error(f"🧠 Failed to initialize AgentCore Memory: {e}")
+                self.memory_client = None
+        else:
+            self.memory_client = None
+            memory_logger.warning("🧠 AgentCore Memory not available (import failed)")
     
-    # Base de conocimientos básica local para fallback
-    local_knowledge = {
-        "soporte": "Para soporte técnico, puedes contactarnos al +1-234-567-8900 o soporte@empresa.com",
-        "horarios": "Nuestros horarios de atención son de lunes a viernes de 9:00 AM a 6:00 PM",
-        "productos": "Ofrecemos una amplia gama de productos y servicios empresariales",
-        "cuenta": "Para consultas sobre tu cuenta, necesitaremos verificar tu identidad",
-        "facturación": "Las consultas de facturación se procesan en horario comercial"
-    }
+    def format_actor_id(self, user_id: str) -> str:
+        """Formato consistente para actor_id."""
+        return f"{self.actor_id_prefix}{user_id}"
     
-    # Búsqueda simple por palabras clave
-    query_lower = query.lower()
-    for keyword, response in local_knowledge.items():
-        if keyword in query_lower:
-            tools_logger.info(f"🔧 LOCAL KB RESULT: Found match for keyword '{keyword}'")
-            return f"ℹ️ **Información básica**: {response}\n\n💡 *Nota: Esta es información básica. Para respuestas más detalladas, recomendamos contactar a nuestro equipo de soporte.*"
+    def create_event(self, actor_id: str, session_id: str, user_message: str, agent_response: str) -> bool:
+        """
+        Guarda un evento (turno de conversación) en memoria de corto plazo.
+        
+        Args:
+            actor_id: ID del actor (usuario)
+            session_id: ID de la sesión de conversación
+            user_message: Mensaje del usuario
+            agent_response: Respuesta del agente
+            
+        Returns:
+            bool: True si se guardó exitosamente
+        """
+        if not self.memory_client:
+            memory_logger.warning("🧠 Cannot create event - Memory client not available")
+            return False
+        
+        try:
+            formatted_actor_id = self.format_actor_id(actor_id)
+            memory_logger.info(f"🔍 CREATE EVENT: actor_id={actor_id} -> formatted={formatted_actor_id}")
+            
+            # Crear evento con mensajes del turno
+            self.memory_client.create_event(
+                memory_id=self.memory_id,
+                actor_id=formatted_actor_id,
+                session_id=session_id,
+                messages=[
+                    (user_message, "USER"),
+                    (agent_response, "ASSISTANT")
+                ]
+            )
+            
+            memory_logger.info(f"🧠 Event created | Actor: {formatted_actor_id} | Session: {session_id}")
+            return True
+            
+        except Exception as e:
+            memory_logger.error(f"🧠 Failed to create event: {e}")
+            return False
     
-    tools_logger.info("🔧 LOCAL KB RESULT: No matches found, returning generic response")
-    return "ℹ️ **No encontré información específica sobre tu consulta**\n\nTe recomiendo:\n• Contactar soporte: +1-234-567-8900\n• Email: soporte@empresa.com\n• Reformular tu pregunta con términos más específicos"
+    def retrieve_memories(self, actor_id: str, session_id: str = None, namespace_type: str = "user_preferences") -> Dict[str, Any]:
+        """
+        Recupera memorias de largo plazo usando las estrategias configuradas.
+        
+        Args:
+            actor_id: ID del actor (usuario)
+            session_id: ID de sesión (opcional, para summaries)
+            namespace_type: Tipo de namespace ("user_preferences", "conversation_summaries", "semantic_memory")
+            
+        Returns:
+            Dict con las memorias recuperadas
+        """
+        if not self.memory_client:
+            memory_logger.warning("🧠 Cannot retrieve memories - Memory client not available")
+            return {"memories": [], "total": 0}
+        
+        try:
+            formatted_actor_id = self.format_actor_id(actor_id)
+            
+            # Obtener el namespace template directamente
+            namespace_template = self.namespaces.get(namespace_type)
+            if not namespace_template:
+                memory_logger.error(f"🧠 Namespace template not found for: {namespace_type}")
+                return {"memories": [], "total": 0}
+            
+            # Construir namespace reemplazando las variables
+            if namespace_type == "conversation_summaries" and session_id:
+                namespace = namespace_template.format(actor_id=formatted_actor_id, session_id=session_id)
+            else:
+                namespace = namespace_template.format(actor_id=formatted_actor_id)
+            
+            # Recuperar memorias del namespace específico
+            response = self.memory_client.retrieve_memories(
+                memory_id=self.memory_id,
+                query="user information",  # Query genérica para obtener memorias del namespace
+                namespace=namespace
+            )
+            
+            # La respuesta puede ser una lista directa o un dict con 'memories'
+            if isinstance(response, list):
+                memories = response
+            else:
+                memories = response.get("memories", [])
+            
+            memory_logger.info(f"🧠 Memories retrieved | Actor: {formatted_actor_id} | Namespace: {namespace} | Count: {len(memories)}")
+            
+            return {
+                "memories": memories,
+                "total": len(memories),
+                "namespace": namespace,
+                "actor_id": formatted_actor_id
+            }
+            
+        except Exception as e:
+            memory_logger.error(f"🧠 Failed to retrieve memories: {e}")
+            return {"memories": [], "total": 0, "error": str(e)}
+    
+    def get_user_context(self, actor_id: str, session_id: str) -> str:
+        """
+        Construye contexto del usuario combinando diferentes tipos de memoria.
+        
+        Args:
+            actor_id: ID del actor (usuario)
+            session_id: ID de sesión
+            
+        Returns:
+            str: Contexto formateado para el agente
+        """
+        context_parts = []
+        
+        try:
+            # Recuperar preferencias del usuario
+            user_prefs = self.retrieve_memories(actor_id, namespace_type="user_preferences")
+            memory_logger.info(f"🧠 USER CONTEXT: Retrieved user preferences - {user_prefs['total']} items")
+            
+            if user_prefs["memories"]:
+                context_parts.append("👤 **Información del usuario:**")
+                for memory in user_prefs["memories"][:3]:  # Máximo 3 preferencias
+                    content = memory.get('content', '') if isinstance(memory, dict) else str(memory)
+                    if content:
+                        context_parts.append(f"- {content}")
+            
+            # Recuperar resúmenes de conversaciones anteriores (solo si hay session_id)
+            if session_id:
+                summaries = self.retrieve_memories(actor_id, session_id, "conversation_summaries")
+                memory_logger.info(f"🧠 USER CONTEXT: Retrieved conversation summaries - {summaries['total']} items")
+                
+                if summaries["memories"]:
+                    context_parts.append("\n📝 **Conversaciones anteriores:**")
+                    for memory in summaries["memories"][:2]:  # Máximo 2 resúmenes
+                        content = memory.get('content', '') if isinstance(memory, dict) else str(memory)
+                        if content:
+                            context_parts.append(f"- {content}")
+            
+            # Recuperar memoria semántica
+            semantic = self.retrieve_memories(actor_id, namespace_type="semantic_memory")
+            memory_logger.info(f"🧠 USER CONTEXT: Retrieved semantic memory - {semantic['total']} items")
+            
+            if semantic["memories"]:
+                context_parts.append("\n🧠 **Contexto relacionado:**")
+                for memory in semantic["memories"][:2]:  # Máximo 2 elementos semánticos
+                    content = memory.get('content', '') if isinstance(memory, dict) else str(memory)
+                    if content:
+                        context_parts.append(f"- {content}")
+            
+            final_context = "\n".join(context_parts) + "\n\n" if context_parts else ""
+            memory_logger.info(f"🧠 USER CONTEXT: Built context with {len(context_parts)} parts | Length: {len(final_context)} chars")
+            
+            return final_context
+            
+        except Exception as e:
+            memory_logger.error(f"🧠 USER CONTEXT ERROR: {e}")
+            return ""
+
+# Instancia global del gestor de memoria
+memory_manager = AgentCoreMemoryManager()
 
 def create_model_ollama():
     """Crea y retorna una instancia del modelo configurado."""
@@ -239,7 +411,6 @@ def create_model_bedrock():
     """Crea y retorna una instancia del modelo configurado."""
     return BedrockModel(**BEDROCK_CONFIG)
 
-print(os.getenv("OPENAI_API_KEY"))
 def create_model_openai():
     """Crea y retorna una instancia del modelo configurado."""
     return OpenAIModel(client_args={
@@ -274,34 +445,30 @@ def get_current_time() -> str:
     return result
 
 @tool
-def search_knowledge_base(query: str, max_results: int = 15, min_score: float = 0.1) -> str:
+def search_knowledge_base(query: str) -> str:
     """
     Busca información en la base de conocimientos de AWS Bedrock.
     
     Args:
         query: Consulta de búsqueda
-        max_results: Número máximo de resultados
-        min_score: Puntuación mínima de relevancia
         
     Returns:
         str: Información relevante encontrada
     """
-    tools_logger.info(f"🔧 TOOL INPUT: search_knowledge_base | Params: query='{query}', max_results={max_results}, min_score={min_score}")
+    tools_logger.info(f"🔧 TOOL INPUT: search_knowledge_base | Params: query='{query}'")
     
     try:
         tools_logger.info(f"🔧 TOOL PROCESSING: search_knowledge_base | Action: Calling Bedrock Knowledge Base retrieve")
         
         # Búsqueda en Bedrock Knowledge Base
-        results = bedrock_client.retrieve(query, max_results, min_score)
+
+        results = bedrock_client.retrieve(query, max_results=15, min_score=0.25)
         
         if results.get('error'):
             tools_logger.error(f"🔧 TOOL ERROR: search_knowledge_base | Bedrock error: {results['error']}")
-            tools_logger.info(f"🔧 TOOL PROCESSING: search_knowledge_base | Action: Falling back to local knowledge base")
-            return search_local_knowledge_base(query)
         
         if not results['results']:
             tools_logger.info(f"🔧 TOOL PROCESSING: search_knowledge_base | Action: No results found in Bedrock, falling back")
-            return search_local_knowledge_base(query)
         
         # Formatear resultados de Bedrock
         formatted_results = []
@@ -335,8 +502,6 @@ def search_knowledge_base(query: str, max_results: int = 15, min_score: float = 
         
     except Exception as e:
         tools_logger.error(f"🔧 TOOL ERROR: search_knowledge_base | Exception: {e}")
-        tools_logger.info(f"🔧 TOOL PROCESSING: search_knowledge_base | Action: Falling back to local knowledge base due to exception")
-        return search_local_knowledge_base(query)
 
 @tool
 def escalate_to_human(reason: str, customer_info: str = "") -> str:
@@ -377,96 +542,6 @@ def escalate_to_human(reason: str, customer_info: str = "") -> str:
     
     return escalation_response
 
-# @tool
-# def advanced_knowledge_search(query: str, search_type: str = "balanced") -> str:
-#     """
-#     Búsqueda avanzada en la Knowledge Base con diferentes configuraciones.
-    
-#     Args:
-#         query: Consulta de búsqueda
-#         search_type: Tipo de búsqueda ("precise", "balanced", "broad")
-        
-#     Returns:
-#         str: Resultados de búsqueda avanzada
-#     """
-#     tools_logger.info(f"🔍 TOOL CALLED: advanced_knowledge_search | Query: '{query}' | Type: {search_type}")
-    
-#     # Configuraciones de búsqueda
-#     search_configs = {
-#         "precise": {"max_results": 5, "min_score": 0.3},
-#         "balanced": {"max_results": 15, "min_score": 0.1},
-#         "broad": {"max_results": 30, "min_score": 0.05}
-#     }
-    
-#     if search_type not in search_configs:
-#         search_type = "balanced"
-    
-#     config = search_configs[search_type]
-    
-#     try:
-#         results = bedrock_client.retrieve(
-#             query, 
-#             max_results=config["max_results"], 
-#             min_score=config["min_score"]
-#         )
-        
-#         if results.get('error'):
-#             tools_logger.error(f"🔍 ADVANCED SEARCH ERROR: {results['error']}")
-#             return f"❌ Error en búsqueda avanzada: {results['error']}"
-        
-#         if not results['results']:
-#             return f"ℹ️ No se encontraron resultados para búsqueda {search_type} con: \"{query}\""
-        
-#         # Formatear resultados avanzados
-#         formatted_results = []
-#         total_results = len(results['results'])
-        
-#         # Mostrar más o menos resultados según el tipo de búsqueda
-#         show_count = {"precise": 3, "balanced": 5, "broad": 8}
-#         display_count = min(show_count[search_type], total_results)
-        
-#         for i, result in enumerate(results['results'][:display_count], 1):
-#             score = result['score']
-#             content = result['content']
-#             location = result.get('location', {})
-            
-#             # Información de fuente si está disponible
-#             source_info = ""
-#             if location:
-#                 if 's3Location' in location:
-#                     s3_info = location['s3Location']
-#                     uri = s3_info.get('uri', 'N/A')
-#                     source_info = f"\n📍 **Fuente:** {uri}"
-            
-#             # Limitar contenido según tipo de búsqueda
-#             content_limits = {"precise": 600, "balanced": 800, "broad": 400}
-#             limit = content_limits[search_type]
-#             content_preview = content[:limit] + "..." if len(content) > limit else content
-            
-#             formatted_results.append(
-#                 f"📄 **Resultado {i}** (relevancia: {score:.3f}){source_info}\n{content_preview}"
-#             )
-        
-#         type_descriptions = {
-#             "precise": "🎯 búsqueda precisa (alta relevancia)",
-#             "balanced": "⚖️ búsqueda equilibrada",
-#             "broad": "🌐 búsqueda amplia (máxima cobertura)"
-#         }
-        
-#         formatted_response = f"🔍 **Búsqueda avanzada ({type_descriptions[search_type]})**\n\n"
-#         formatted_response += f"📊 **{total_results} resultados** para: \"{query}\"\n"
-#         formatted_response += f"🎚️ **Configuración:** máx. {config['max_results']} resultados, relevancia mín. {config['min_score']}\n\n"
-#         formatted_response += "\n\n".join(formatted_results)
-        
-#         if total_results > display_count:
-#             formatted_response += f"\n\n💡 *Se encontraron {total_results - display_count} resultados adicionales.*"
-        
-#         tools_logger.info(f"🔍 ADVANCED SEARCH RESULT: {total_results} total results | Displayed: {display_count}")
-#         return formatted_response
-        
-#     except Exception as e:
-#         tools_logger.error(f"🔍 ADVANCED SEARCH ERROR: {e}")
-#         return f"❌ Error en búsqueda avanzada: {str(e)}"
 
 # ==========================================
 # AGENTES ESPECIALIZADOS
@@ -490,19 +565,7 @@ def knowledge_assistant(query: str) -> str:
         
         agent = Agent(
             model=create_model_openai(),
-            system_prompt="""Eres un asistente de conocimiento especializado en información de la empresa.
-            Tu trabajo es responder preguntas frecuentes usando la información de la base de conocimientos.
-            
-            Pautas:
-            - Prioriza usar search_knowledge_base que conecta con AWS Bedrock Knowledge Base
-            - Sé claro y conciso en tus respuestas
-            - Usa emojis para mejorar la legibilidad
-            - Si no tienes la información exacta, sugiere contactar soporte
-            - Siempre mantén un tono amigable y profesional
-            
-            Herramientas disponibles:
-            - search_knowledge_base: Búsqueda principal en Bedrock KB
-            - get_current_time: Obtener fecha/hora actual""",
+            system_prompt=SYSTEM_PROMPT_KNOWLEDGE_ASSISTANT,
             tools=[search_knowledge_base, get_current_time]
         )
         
@@ -530,62 +593,45 @@ class CustomerServiceOrchestrator:
     def __init__(self, context: Optional['RequestContext'] = None):
         self.model = create_model_openai()
         self.context = context
-        self.session_id = context.session_id if context else None
+        self.session_id = context.session_id if context else f"local_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        memory_logger.info(f"🧠 ORCHESTRATOR INIT: Session {self.session_id}")
+        # Configurar memoria nativa de AgentCore si está disponible
+        if AgentCoreMemoryToolProvider and MEMORY_CONFIG["memory_id"]:
+            try:
+                # Crear provider de memoria usando el namespace de preferencias
+                namespace = MEMORY_CONFIG["namespaces"]["user_preferences"]
+                
+                self.memory_provider = AgentCoreMemoryToolProvider(
+                    memory_id=MEMORY_CONFIG["memory_id"],
+                    actor_id=f"customer_agent_{self.session_id}",  # Actor ID único por sesión
+                    session_id=self.session_id,
+                    namespace=namespace,  # Namespace ya configurado desde .env
+                    region=MEMORY_CONFIG["region"]
+                )
+                memory_logger.info(f"🧠 ORCHESTRATOR INIT: AgentCore Memory provider enabled | Session: {self.session_id}")
+            except Exception as e:
+                memory_logger.error(f"🧠 ORCHESTRATOR INIT: Failed to setup memory provider: {e}")
+                self.memory_provider = None
+        else:
+            self.memory_provider = None
+            memory_logger.info(f"🧠 ORCHESTRATOR INIT: AgentCore Memory provider disabled | Session: {self.session_id}")
         
-        # Prompt del sistema optimizado para servicio al cliente con Bedrock
-        self.system_prompt = """🤖 **Eres el Agente Principal de Servicio al Cliente con AWS Bedrock Knowledge Base**
+        # Prompt del sistema optimizado para servicio al cliente con Bedrock y memoria
+        self.system_prompt = SYSTEM_PROMPT_SERVICE_AGENT_V2
 
-                            Tu misión es proporcionar un servicio excepcional coordinando con asistentes especializados y accediendo a información actualizada desde AWS Bedrock.
-
-                            ## 🎯 **Capacidades disponibles:**
-
-                            **📚 Knowledge Assistant**: Información general, FAQ, políticas desde AWS Bedrock Knowledge Base
-                            **🚀 Escalation**: Transferencia a agentes humanos cuando sea necesario
-
-                            ## 📋 **Pautas de interacción:**
-
-                            1. **Saluda cordialmente** y pregunta cómo puedes ayudar
-                            2. **Analiza la consulta** para determinar el asistente especializado apropiado
-                            3. **Prioriza información de Bedrock** para respuestas más precisas y actualizadas
-                            4. **Delega** a los asistentes especializados según corresponda
-                            5. **Mantén el contexto** de la conversación y da seguimiento
-                            6. **Escala a humanos** para casos complejos o cuando el cliente lo solicite
-                            7. **Sé proactivo** sugiriendo soluciones adicionales
-
-                            ## 🎨 **Estilo de comunicación:**
-                            - Amigable y profesional
-                            - Claro y conciso
-                            - Empático con las necesidades del cliente
-                            - Uso apropiado de emojis para mejorar la experiencia
-                            - Respuestas estructuradas y fáciles de leer
-                            - Menciona cuando la información viene de la base de conocimientos actualizada
-
-                            ## ⚠️ **Casos de escalación:**
-                            - Quejas complejas
-                            - Problemas que requieren autorización especial
-                            - Consultas fuera del alcance de los asistentes
-                            - Solicitud explícita del cliente
-                            - Fallos en la conexión con Bedrock que no se pueden resolver
-
-                            ## 🔧 **Manejo de errores:**
-                            - Si hay problemas con Bedrock, responde que no hay conexión con la base de conocimientos y que no puedes ayudarlo en este momento.
-                            - Si no te sabes la respuesta, no inventes información.
-                            - Si la informacion no esta disponible, menciona que no tienes la informacion y que no sabes la respuesta.
-
-                            Comienza cada conversación con una presentación amigable y pregunta específica sobre cómo puedes ayudar."""
-
-        # Crear el agente principal
+        # Crear el agente principal con herramientas (incluyendo memoria si está disponible)
+        tools = [knowledge_assistant]
+        if self.memory_provider and hasattr(self.memory_provider, 'tools'):
+            tools.extend(self.memory_provider.tools)
+            
         self.orchestrator = Agent(
             model=self.model,
             system_prompt=self.system_prompt,
-            tools=[
-                knowledge_assistant,
-                escalate_to_human,
-                get_current_time,
-            ]
+            tools=tools
         )
+        
+        memory_tools_count = len(self.memory_provider.tools) if self.memory_provider and hasattr(self.memory_provider, 'tools') else 0
+        memory_logger.info(f"🧠 ORCHESTRATOR INIT: Agent created | Total tools: {len(tools)} | Memory tools: {memory_tools_count} | Provider: {'✅' if self.memory_provider else '❌'}")
     
     def chat(self, message: str, user_id: str = None) -> str:
         """
@@ -601,17 +647,30 @@ class CustomerServiceOrchestrator:
         orchestrator_logger.info(f"🎯 ORCHESTRATOR INPUT: '{message}' | User: {user_id} | Session: {self.session_id}")
         
         try:
-            # Recuperar historial de conversación si existe
+            # Obtener contexto del usuario desde AgentCore Memory
+            user_context = ""
+            if user_id and self.session_id:
+                user_context = memory_manager.get_user_context(user_id, self.session_id)
+            
+            # Recuperar historial de conversación local (para compatibilidad)
             conversation_history = self._get_conversation_history()
             
-            # Construir contexto completo del mensaje
-            contextualized_message = self._build_contextualized_message(message, user_id, conversation_history)
+            # Construir contexto completo del mensaje incluyendo memoria de largo plazo
+            contextualized_message = self._build_contextualized_message(message, user_id, conversation_history, user_context)
             
-            # Procesar mensaje con el orchestrator
+            # Procesar mensaje con el orchestrator (que ahora tiene herramientas de memoria)
             response = self.orchestrator(contextualized_message)
             
-            # Guardar interacción en memoria
+            # Guardar interacción en memoria local (para compatibilidad)
             self._save_interaction(message, str(response), user_id)
+            
+            # Guardar evento en AgentCore Memory (short-term -> long-term extraction)
+            if user_id and self.session_id:
+                memory_logger.info(f"🔍 SAVING EVENT: user_id={user_id}, session={self.session_id}")
+                memory_logger.info(f"🔍 USER MESSAGE: {message}")
+                memory_logger.info(f"🔍 AGENT RESPONSE: {str(response)[:200]}...")
+                # Usar user_id directamente (el método create_event formatea internamente)
+                memory_manager.create_event(user_id, self.session_id, message, str(response))
             
             orchestrator_logger.info(f"🎯 ORCHESTRATOR OUTPUT: Length: {len(str(response))} chars | Preview: {str(response)[:100]}...")
             return str(response)
@@ -677,35 +736,37 @@ class CustomerServiceOrchestrator:
         except Exception as e:
             memory_logger.error(f"🧠 MEMORY ERROR: Failed to save interaction - {e}")
     
-    def _build_contextualized_message(self, message: str, user_id: str = None, history: List[Dict] = None) -> str:
-        """Construye un mensaje contextualizado con historial de conversación."""
-        if not history:
-            # Primera interacción o sin historial
-            context_prefix = f"Usuario {user_id}: {message}" if user_id else message
-            memory_logger.info("🧠 CONTEXT: First interaction, no previous history")
-            return context_prefix
-        
-        # Construir contexto con historial reciente
+    def _build_contextualized_message(self, message: str, user_id: str = None, history: List[Dict] = None, user_context: str = "") -> str:
+        """Construye un mensaje contextualizado con historial de conversación y memoria de largo plazo."""
         context_parts = []
         
-        # Añadir resumen del historial reciente (hasta 3 interacciones anteriores)
-        recent_history = history[-3:] if len(history) > 3 else history
+        # Añadir contexto de memoria de largo plazo si está disponible
+        if user_context:
+            context_parts.append("🧠 **Memoria de largo plazo del usuario:**")
+            context_parts.append(user_context)
         
-        if recent_history:
-            context_parts.append("📝 **Contexto de conversación anterior:**")
-            for i, interaction in enumerate(recent_history, 1):
-                context_parts.append(f"Interacción {i}:")
-                context_parts.append(f"Usuario: {interaction.get('user_message', 'N/A')}")
-                context_parts.append(f"Agente: {interaction.get('agent_response', 'N/A')[:100]}...")
-                context_parts.append("")
+        # Añadir historial de sesión reciente si existe
+        if history:
+            # Añadir resumen del historial reciente (hasta 3 interacciones anteriores)
+            recent_history = history[-3:] if len(history) > 3 else history
+            
+            if recent_history:
+                context_parts.append("📝 **Contexto de conversación actual:**")
+                for i, interaction in enumerate(recent_history, 1):
+                    context_parts.append(f"Interacción {i}:")
+                    context_parts.append(f"Usuario: {interaction.get('user_message', 'N/A')}")
+                    context_parts.append(f"Agente: {interaction.get('agent_response', 'N/A')[:100]}...")
+                    context_parts.append("")
         
-        # Añadir mensaje actual
+        # Añadir mensaje actual (sin incluir user_id para evitar propagación)
         context_parts.append("💬 **Mensaje actual:**")
-        context_parts.append(f"Usuario {user_id}: {message}" if user_id else message)
+        context_parts.append(message)
         
         contextualized_message = "\n".join(context_parts)
         
-        memory_logger.info(f"🧠 CONTEXT: Built contextualized message | History items: {len(recent_history)}")
+        has_long_term = bool(user_context)
+        has_history = bool(history)
+        memory_logger.info(f"🧠 CONTEXT: Built contextualized message | Long-term: {has_long_term} | History: {len(history) if history else 0} items")
         
         return contextualized_message
 

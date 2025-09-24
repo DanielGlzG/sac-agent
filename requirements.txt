@@ -4,6 +4,8 @@ strands-agents-tools>=0.2.0
 # AWS Bedrock AgentCore (para ejecución con AgentCore CLI)
 bedrock_agentcore
 
+# AgentCore Memory integration
+
 # Dependencias adicionales para el agente de servicio al cliente
 python-dotenv>=0.19.0
 

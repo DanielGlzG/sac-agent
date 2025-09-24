@@ -6,19 +6,6 @@ from typing import Dict, Any, Optional
 from bedrock_agentcore import BedrockAgentCoreApp
 from bedrock_agentcore.runtime.context import RequestContext
 
-
-# Import your existing text-to-sql function
-import sys
-import os
-
-# Ensure we can import from the current directory
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-
-# Change working directory to ensure relative imports work
-os.chdir(current_dir)
-
 from customer_service_agent import CustomerServiceOrchestrator
 
 
@@ -78,7 +65,7 @@ async def customer_service_agent(payload: Dict[str, Any], context: RequestContex
         Dict with success status, response, and execution details
     """
     start_time = datetime.now()
-    session_id = context.session_id
+    session_id = context.session_id or f"agentcore_{start_time.strftime('%Y%m%d_%H%M%S_%f')}"
     
     try:
         # Validate payload format
@@ -105,6 +92,10 @@ async def customer_service_agent(payload: Dict[str, Any], context: RequestContex
         print(f"📝 Query: {user_query}")
         
         # Create customer service orchestrator with AgentCore context
+        # Ensure context has session_id
+        if not hasattr(context, 'session_id') or not context.session_id:
+            context.session_id = session_id
+            
         orchestrator = CustomerServiceOrchestrator(context)
         
         # Process message using customer service agent
@@ -165,21 +156,6 @@ async def customer_service_agent(payload: Dict[str, Any], context: RequestContex
         }
 
 
-@app.ping
-def ping():
-    return "Healthy"
-
-
-
 if __name__ == "__main__":
     print("🚀 Starting AgentCore Customer Service Agent...")
-    print("📡 Server will be available at: http://localhost:8080")
-    print("🔄 Endpoints:")
-    print("   POST /invocations - Customer Service Agent processing")
-    print("   GET  /ping       - Health check")
-    print("🎯 Features:")
-    print("   💬 Conversational AI with session memory")
-    print("   🔍 AWS Bedrock Knowledge Base integration")
-    print("   🚀 Human escalation support")
-    print("   📊 Detailed execution logging")
     app.run()
